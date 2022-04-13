@@ -26,31 +26,19 @@ import numpy as np
 import os
 import tempfile
 import time
-from tvm.meta_schedule import ReplayTraceConfig, tune_tir
-from tvm.meta_schedule.integration import extract_task_from_relax
+from tvm.meta_schedule.apply_history_best import ApplyHistoryBest
+from tvm.meta_schedule.utils import autotvm_silencer
 from tvm.meta_schedule.database import JSONDatabase
 from tvm import transform
+from tvm.ir.transform import PassContext
+from tvm.contrib import graph_executor
 from tvm import meta_schedule as ms
-
-from tvm.meta_schedule.search_strategy import (
-    EvolutionarySearch,
-    #EvolutionarySearchConfig,
-    MeasureCandidate,
-    ReplayFunc,
-    ReplayTrace,
-    SearchStrategy,
-)
-
+from tvm.relay import build as relay_build
 from tvm.meta_schedule.builder import LocalBuilder
 from tvm.meta_schedule.runner import LocalRunner
 
 
-def autotir_tune(batch_size, target, database, is_tune, layout="NHWC", dtype="float32"):
-    if layout == "NHWC":
-        image_shape = (224, 224, 3)
-    elif layout == "NCHW":
-        image_shape = (3, 224, 224)
-
+def get_resnet(batch_size, dtype, layout, image_shape):
     relay_mod, params = testing.resnet.get_workload(
         num_layers=50,
         batch_size=batch_size,
@@ -58,55 +46,44 @@ def autotir_tune(batch_size, target, database, is_tune, layout="NHWC", dtype="fl
         layout=layout,
         image_shape=image_shape,
     )
-
     relax_mod = relay_translator.from_relay(relay_mod["main"])
-
-    if is_tune:
-        print("tuning")
-        runner = LocalRunner()
-        builder = LocalBuilder()
-        tasks = extract_task_from_relax(relax_mod, target=target)
-        print("total tasks:", len(tasks))
-        for task in tasks:
-            print(f"Extracted task: {task.task_name}, {task.target}")
-            with tempfile.TemporaryDirectory() as work_dir:
-                sch = tune_tir(
-                    mod=task.mod,
-                    target=target,
-                    #config=EvolutionarySearch(
-                    #    num_trials_per_iter=2,
-                    #    num_trials_total=50,
-                    #),
-                    config=ms.EvolutionarySearchConfig(
-                        num_trials_per_iter=32, # 32 / 64
-                        max_trials_per_task=500, # 20000
-                        max_trials_global=20000 # 20000
-                        # population_size=10, # default 
-                        # init_measured_ratio=0.1,
-                        # init_min_unmeasured=50,
-                        # genetic_num_iters=3,
-                        # genetic_mutate_prob=0.5,
-                        # genetic_max_fail_count=10,
-                        # eps_greedy=0.9
-                    ),
-                    builder=builder,
-                    runner=runner,
-                    work_dir=work_dir,
-                    database=database,
-                    num_threads=31,
-                )
     return relay_mod, params, relax_mod
 
 
+def create_database(network, layout, batch_size, target, is_relax=True):
+    workload_file = "%s_autotir_logs/%s-%s-B%d-%s-workload.json" % (
+        "relax" if is_relax else "relay",
+        network,
+        layout,
+        batch_size,
+        target.kind.name,
+    )
+
+    tuning_record_file = "%s_autotir_logs/%s-%s-B%d-%s-tuning_record.json" % (
+        "relax" if is_relax else "relay",
+        network,
+        layout,
+        batch_size,
+        target.kind.name,
+    )
+    is_tuned = os.path.exists(workload_file)
+    os.makedirs(os.path.dirname(workload_file), exist_ok=True)
+
+    database = JSONDatabase(
+        path_workload=workload_file,
+        path_tuning_record=tuning_record_file,
+    )
+    return database, is_tuned
+
+
 if __name__ == "__main__":
-    target = tvm.target.Target("nvidia/nvidia-v100") #nvidia/geforce-rtx-2080-ti")
-    # target = tvm.target.Target("cuda -libs=thrust")
+    target = tvm.target.Target("nvidia/nvidia-v100")
+    # target = tvm.target.Target("nvidia/geforce-rtx-2080-ti") for Kraken
     network = "resnet-50"
     batch_size = 1
     layout = "NCHW"
-    # layout = "NHWC"
     dtype = "float32"
-
+    # layout = "NHWC"
     if layout == "NHWC":
         image_shape = (224, 224, 3)
     elif layout == "NCHW":
@@ -114,58 +91,84 @@ if __name__ == "__main__":
     else:
         raise ValueError("Invalid layout: " + layout)
     input_shape = (batch_size,) + image_shape
+    total_trials = 20000
+    times = 1000
+    input_name = "data"
 
-    workload_file = "autotir_logs/" + "%s-%s-B%d-%s-workload.json" % (
-        network,
-        layout,
-        batch_size,
-        target.kind.name,
+    relay_database, relay_tuned = create_database(
+        network, layout, batch_size, target, is_relax=False
     )
+    relax_database, relax_tuned = create_database(network, layout, batch_size, target)
 
-    tuning_record_file = "autotir_logs/" + "%s-%s-B%d-%s-tuning_record.json" % (
-        network,
-        layout,
-        batch_size,
-        target.kind.name,
-    )
+    relay_mod, relay_params, relax_mod = get_resnet(batch_size, dtype, layout, image_shape)
 
-    os.makedirs(os.path.dirname(workload_file), exist_ok=True)
-    is_tune = not os.path.exists(workload_file)
-
-    database = JSONDatabase(
-        path_workload=workload_file,
-        path_tuning_record=tuning_record_file,
-    )
-
-    # tune the model
-    relay_mod, relay_params, relax_mod = autotir_tune(
-        batch_size, target, database, is_tune, layout, dtype
-    )
-
-    # resnet benchmarking
-    with transform.PassContext(opt_level=3):
-        relax_mod = relax.transform.MetaScheduleApplyHistoryBest(database, target)(relax_mod)
-        relax_ex = relax.vm.build(relax_mod, target=target)
+    if relay_tuned:
+        with target, autotvm_silencer(), ApplyHistoryBest(relay_database):
+            with PassContext(
+                opt_level=3,
+                config={"relay.backend.use_meta_schedule": True},
+            ):
+                relay_ex = relay_build(relay_mod, target=target, params=relay_params)
+    else:
+        # Tune Relay resnet
+        with tempfile.TemporaryDirectory() as work_dir:
+            relay_ex = ms.tune_relay(
+                mod=relay_mod,
+                params=relay_params,
+                target=target,
+                config=ms.EvolutionarySearchConfig(
+                    num_trials_per_iter=32,  # 32 / 64
+                    max_trials_per_task=total_trials,  # 20000
+                    max_trials_global=total_trials,  # 20000
+                ),
+                work_dir=work_dir,
+                database=relay_database,
+            )
 
     input_shape = (1, 3, 224, 224)
-    data = tvm.nd.array(np.random.rand(*input_shape).astype(np.float32), tvm.cuda())
+    dev = tvm.cpu() if str(target).startswith("llvm") else tvm.cuda()
+    data = tvm.nd.array(np.random.rand(*input_shape).astype(np.float32), dev)
     params = nn.init_params(relax_mod)
-    
+
     # measure relay performance
-    with transform.PassContext(opt_level=3):
-        exe = relay.vm.compile(relay_mod, target, params=relay_params)
-    relay_vm = vm_rt.VirtualMachine(exe, tvm.cuda())
-    result = relay_vm.run(data)
-    
-    times = 1000
+    module = graph_executor.GraphModule(relay_ex["default"](dev))
+    module.set_input(input_name, data)
+    # warmup
+    module.run()
+    # get the output
+    # module.get_output(0).numpy()
     tic = time.time()
     for i in range(times):
-        relay_vm.run(data)
+        module.run()
     toc = time.time()
     e0 = (toc - tic) * 1000 / times
 
+    print(f"relay resnet50 inference perf: {e0} ms")
+
+    if relax_tuned:
+        with transform.PassContext(opt_level=3):
+            relax_mod = relax.transform.MetaScheduleApplyHistoryBest(relax_database, target)(
+                relax_mod
+            )
+            relax_ex = relax.vm.build(relax_mod, target=target)
+    else:
+        # Tune Relax resnet
+        with tempfile.TemporaryDirectory() as work_dir:
+            relax_ex = ms.tune_relax(
+                mod=relax_mod,
+                target=target,
+                config=ms.EvolutionarySearchConfig(
+                    num_trials_per_iter=32,  # 32 / 64
+                    max_trials_per_task=total_trials,  # 20000
+                    max_trials_global=total_trials,  # 20000
+                ),
+                work_dir=work_dir,
+                database=relax_database,
+            )
+
     # measure relax performance
-    relax_vm = relax.VirtualMachine(relax_ex, tvm.cuda())
+    relax_vm = relax.VirtualMachine(relax_ex, dev)
+    # warmup
     res = relax_vm["main"](data, *params)
     tic = time.time()
     for i in range(times):
@@ -173,5 +176,4 @@ if __name__ == "__main__":
     toc = time.time()
     e1 = (toc - tic) * 1000 / times
 
-    print(f"relay: {e0} ms")
-    print(f"relax: {e1} ms")
+    print(f"relax resnet50 inference perf: {e1} ms")
